@@ -1,0 +1,8 @@
+# Pin cross images to 0.2.5 (Ubuntu 20.04, glibc 2.31).
+# The reMarkable 2 ships glibc 2.35 — newer cross images (Ubuntu 24.04, glibc 2.39)
+# produce binaries that fail on device with "GLIBC_2.39 not found".
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"

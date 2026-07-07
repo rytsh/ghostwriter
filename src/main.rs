@@ -3,6 +3,7 @@ use clap::Parser;
 use dotenv::dotenv;
 use log::info;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
@@ -21,7 +22,7 @@ use ghostwriter::{
     simulation::SimulationConfig,
     status::GhostwriterStatus,
     touch::{PenTool, Touch, TriggerCorner},
-    util::{setup_uinput, svg_to_alpha_bitmap, svg_to_bitmap, write_bitmap_to_file, OptionMap},
+    util::{sanitize_svg, setup_uinput, svg_to_alpha_bitmap, svg_to_bitmap, write_bitmap_to_file, OptionMap},
     web_server::start_web_server,
 };
 
@@ -79,6 +80,17 @@ pub struct Args {
     /// Disable keyboard progress
     #[arg(long)]
     no_draw_progress: bool,
+
+    /// Skip automatic pen tool selection (palette taps) before/after drawing.
+    /// Use this if the toolbar taps hit the wrong UI elements on your device.
+    #[arg(long)]
+    no_tool_select: bool,
+
+    /// Drawing method: "centerline" traces single-stroke skeletons (fast, few
+    /// strokes, clean undo history); "pressure" fills the rasterized bitmap
+    /// scanline-by-scanline with alpha-based pen pressure (slow, many strokes).
+    #[arg(long, default_value = "centerline")]
+    draw_method: String,
 
     /// Input PNG file for testing
     #[arg(long)]
@@ -200,8 +212,8 @@ fn draw_text(text: &str, keyboard: &mut Keyboard) -> Result<()> {
     Ok(())
 }
 
-fn draw_svg(svg_data: &str, keyboard: &mut Keyboard, pen: &mut Pen, save_bitmap: Option<&String>, no_draw: bool) -> Result<()> {
-    info!("Drawing SVG to the screen.");
+fn draw_svg(svg_data: &str, keyboard: &mut Keyboard, pen: &mut Pen, save_bitmap: Option<&String>, no_draw: bool, draw_method: &str) -> Result<()> {
+    info!("Drawing SVG to the screen (method: {}).", draw_method);
     keyboard.progress_end()?;
     let scale = 2u32;
     if let Some(save_bitmap) = save_bitmap {
@@ -209,9 +221,19 @@ fn draw_svg(svg_data: &str, keyboard: &mut Keyboard, pen: &mut Pen, save_bitmap:
         write_bitmap_to_file(&bitmap, save_bitmap)?;
     }
     if !no_draw {
-        // Use alpha-to-pressure rendering for best quality: anti-aliased edges via pen pressure
-        let alpha_bitmap = svg_to_alpha_bitmap(svg_data, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
-        pen.draw_bitmap_alpha_pressure(&alpha_bitmap, scale)?;
+        match draw_method {
+            // Scanline fill with alpha-based pen pressure: visually filled glyphs,
+            // but thousands of tiny strokes — slow and bloats xochitl's undo history
+            "pressure" => {
+                let alpha_bitmap = svg_to_alpha_bitmap(svg_data, VIRTUAL_WIDTH * scale, VIRTUAL_HEIGHT * scale)?;
+                pen.draw_bitmap_alpha_pressure(&alpha_bitmap, scale)?;
+            }
+            // Default: trace single-stroke centerlines like real handwriting —
+            // few strokes, fast, clean undo history
+            _ => {
+                pen.draw_svg_centerline(svg_data)?;
+            }
+        }
     }
     Ok(())
 }
@@ -413,8 +435,19 @@ async fn run_ghostwriter_loop(
 
     let mut engine = create_engine(&engine_name, &engine_options)?;
 
+    // Progress-mark indicator: set when the "working" mark is drawn on screen,
+    // cleared by whoever removes it (draw_svg callback or processing_task cleanup)
+    let progress_indicator = Arc::new(AtomicBool::new(false));
+
     // Register tools
-    register_tools(&mut engine, Arc::clone(&keyboard), Arc::clone(&pen), Arc::clone(&touch), &config)?;
+    register_tools(
+        &mut engine,
+        Arc::clone(&keyboard),
+        Arc::clone(&pen),
+        Arc::clone(&touch),
+        Arc::clone(&progress_indicator),
+        &config,
+    )?;
 
     let engine = Arc::new(TokioMutex::new(engine));
 
@@ -471,6 +504,8 @@ async fn run_ghostwriter_loop(
                     let progress_tx_clone = progress_tx.clone();
                     let cancellation_clone = Arc::clone(&cancellation);
                     let touch_clone = Arc::clone(&touch);
+                    let pen_clone = Arc::clone(&pen);
+                    let indicator_clone = Arc::clone(&progress_indicator);
                     tokio::spawn(async move {
                         coordinator::processing_task(
                             config_clone,
@@ -478,6 +513,8 @@ async fn run_ghostwriter_loop(
                             progress_tx_clone,
                             cancellation_clone,
                             touch_clone,
+                            pen_clone,
+                            indicator_clone,
                         ).await
                     })
                 };
@@ -559,46 +596,59 @@ async fn run_ghostwriter_loop(
 }
 
 // Helper function to register tools with the engine
-fn register_tools(engine: &mut Box<dyn LLMEngine>, keyboard: Arc<Mutex<Keyboard>>, pen: Arc<Mutex<Pen>>, _touch: Arc<TokioRwLock<Touch>>, config: &Config) -> Result<()> {
+fn register_tools(
+    engine: &mut Box<dyn LLMEngine>,
+    keyboard: Arc<Mutex<Keyboard>>,
+    pen: Arc<Mutex<Pen>>,
+    _touch: Arc<TokioRwLock<Touch>>,
+    progress_indicator: Arc<AtomicBool>,
+    config: &Config,
+) -> Result<()> {
     use serde_json::Value as json;
 
-    // Register draw_text tool
-    let output_file = config.output_file.clone();
-    let no_draw = config.no_draw;
-    let keyboard_clone = Arc::clone(&keyboard);
+    // Register draw_text tool — skip when the keyboard is disabled so the model
+    // never sees a tool whose output would be silently dropped
+    if !config.no_keyboard {
+        let output_file = config.output_file.clone();
+        let no_draw = config.no_draw;
+        let keyboard_clone = Arc::clone(&keyboard);
 
-    let tool_config_draw_text = load_config("tool_draw_text.json");
-    engine.register_tool(
-        "draw_text",
-        serde_json::from_str::<serde_json::Value>(tool_config_draw_text.as_str())?,
-        Box::new(move |arguments: json| {
-            let text = match arguments["text"].as_str() {
-                Some(t) => t,
-                None => {
-                    log::error!("draw_text tool called without valid 'text' argument");
-                    return;
+        let tool_config_draw_text = load_config("tool_draw_text.json");
+        engine.register_tool(
+            "draw_text",
+            serde_json::from_str::<serde_json::Value>(tool_config_draw_text.as_str())?,
+            Box::new(move |arguments: json| {
+                let text = match arguments["text"].as_str() {
+                    Some(t) => t,
+                    None => {
+                        log::error!("draw_text tool called without valid 'text' argument");
+                        return;
+                    }
+                };
+                if let Some(output_file) = &output_file {
+                    if let Err(e) = std::fs::write(output_file, text) {
+                        log::error!("Failed to write output file: {}", e);
+                    }
                 }
-            };
-            if let Some(output_file) = &output_file {
-                if let Err(e) = std::fs::write(output_file, text) {
-                    log::error!("Failed to write output file: {}", e);
+                if !no_draw {
+                    if let Err(e) = draw_text(text, &mut lock!(keyboard_clone)) {
+                        log::error!("Failed to draw text: {}", e);
+                    }
                 }
-            }
-            if !no_draw {
-                if let Err(e) = draw_text(text, &mut lock!(keyboard_clone)) {
-                    log::error!("Failed to draw text: {}", e);
-                }
-            }
-        }),
-    );
+            }),
+        );
+    }
 
     // Register draw_svg tool
     if !config.no_svg {
         let output_file = config.output_file.clone();
         let save_bitmap = config.save_bitmap.clone();
         let no_draw = config.no_draw;
+        let no_tool_select = config.no_tool_select;
+        let draw_method = config.draw_method.clone();
         let keyboard_clone = Arc::clone(&keyboard);
         let pen_clone = Arc::clone(&pen);
+        let indicator = Arc::clone(&progress_indicator);
         let test_mode = config.is_test_mode();
 
         let tool_config_draw_svg = load_config("tool_draw_svg.json");
@@ -613,16 +663,30 @@ fn register_tools(engine: &mut Box<dyn LLMEngine>, keyboard: Arc<Mutex<Keyboard>
                         return;
                     }
                 };
+                // Fix escaped/wrapped markup from LLM responses (\u003c, &lt;svg, markdown fences)
+                let svg_data = &sanitize_svg(svg_data);
                 if let Some(output_file) = &output_file {
                     if let Err(e) = std::fs::write(output_file, svg_data) {
                         log::error!("Failed to write output file: {}", e);
                     }
                 }
 
+                // Remove the "working" progress mark (single undo) before drawing the
+                // answer, so the undo cannot eat any answer strokes
+                if !no_draw && !test_mode && indicator.load(Ordering::SeqCst) {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            coordinator::clear_progress_mark(&indicator).await;
+                        })
+                    });
+                }
+
                 // Switch to fineliner before drawing, remember original tool for restore
                 // Use a fresh Touch instance to avoid deadlock with trigger_task which
                 // holds the shared touch RwLock indefinitely while waiting for user trigger
-                let previous_tool = if !no_draw && !test_mode {
+                // Skipped with --no-tool-select: blind palette taps can hit the wrong UI
+                // elements (e.g. the text tool, which opens the on-screen keyboard)
+                let previous_tool = if !no_draw && !test_mode && !no_tool_select {
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
                             Touch::new(false, TriggerCorner::UpperRight).select_fineliner().await
@@ -634,7 +698,7 @@ fn register_tools(engine: &mut Box<dyn LLMEngine>, keyboard: Arc<Mutex<Keyboard>
 
                 let mut keyboard = lock!(keyboard_clone);
                 let mut pen = lock!(pen_clone);
-                if let Err(e) = draw_svg(svg_data, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw) {
+                if let Err(e) = draw_svg(svg_data, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw, &draw_method) {
                     log::error!("Failed to draw SVG: {}", e);
                 }
                 drop(keyboard);

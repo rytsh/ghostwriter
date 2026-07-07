@@ -77,8 +77,6 @@ impl Pen {
     /// Input coordinates are computed directly from bitmap pixel position for true sub-pixel accuracy,
     /// bypassing integer rounding through the virtual coordinate space.
     pub fn draw_bitmap_scaled(&mut self, bitmap: &[Vec<bool>], scale: u32) -> Result<()> {
-        let max_x = self.max_x_value() as f32;
-        let max_y = self.max_y_value() as f32;
         let bmp_w = VIRTUAL_WIDTH as f32 * scale as f32;
         let bmp_h = VIRTUAL_HEIGHT as f32 * scale as f32;
 
@@ -86,8 +84,7 @@ impl Pen {
         for (y, row) in bitmap.iter().enumerate() {
             for (x, &pixel) in row.iter().enumerate() {
                 if pixel {
-                    let ix = ((x as f32 / bmp_w) * max_x).round() as i32;
-                    let iy = ((y as f32 / bmp_h) * max_y).round() as i32;
+                    let (ix, iy) = self.normalized_to_input(x as f32 / bmp_w, y as f32 / bmp_h);
                     if !is_pen_down {
                         self.pen_down_at((ix, iy))?;
                         is_pen_down = true;
@@ -344,14 +341,12 @@ impl Pen {
     /// Draw a bitmap bidirectionally — alternating L→R and R→L per row.
     /// This cancels the directional bias that causes horizontal leaking.
     pub fn draw_bitmap_bidi(&mut self, bitmap: &[Vec<bool>], scale: u32) -> Result<()> {
-        let max_x = self.max_x_value() as f32;
-        let max_y = self.max_y_value() as f32;
         let bmp_w = VIRTUAL_WIDTH as f32 * scale as f32;
         let bmp_h = VIRTUAL_HEIGHT as f32 * scale as f32;
 
         let mut is_pen_down = false;
         for (y, row) in bitmap.iter().enumerate() {
-            let iy = ((y as f32 / bmp_h) * max_y).round() as i32;
+            let y_norm = y as f32 / bmp_h;
             let cols = row.len();
 
             // Collect runs in this row
@@ -387,18 +382,18 @@ impl Pen {
                     (x_start, x_end)
                 };
 
-                let ix_from = ((draw_from as f32 / bmp_w) * max_x).round() as i32;
-                let ix_to = ((draw_to as f32 / bmp_w) * max_x).round() as i32;
+                let from = self.normalized_to_input(draw_from as f32 / bmp_w, y_norm);
+                let to = self.normalized_to_input(draw_to as f32 / bmp_w, y_norm);
 
                 if is_pen_down {
                     self.pen_up()?;
                     is_pen_down = false;
                     sleep(Duration::from_millis(1));
                 }
-                self.pen_down_at((ix_from, iy))?;
+                self.pen_down_at(from)?;
                 is_pen_down = true;
                 sleep(Duration::from_millis(1));
-                self.goto_xy((ix_to, iy))?;
+                self.goto_xy(to)?;
                 self.pen_up()?;
                 is_pen_down = false;
                 sleep(Duration::from_millis(1));
@@ -417,8 +412,6 @@ impl Pen {
     /// Draw a bitmap column-first — scanning each column top→bottom.
     /// This rotates the directional bias 90° so it appears vertically instead of horizontally.
     pub fn draw_bitmap_col(&mut self, bitmap: &[Vec<bool>], scale: u32) -> Result<()> {
-        let max_x = self.max_x_value() as f32;
-        let max_y = self.max_y_value() as f32;
         let bmp_w = VIRTUAL_WIDTH as f32 * scale as f32;
         let bmp_h = VIRTUAL_HEIGHT as f32 * scale as f32;
 
@@ -429,14 +422,14 @@ impl Pen {
         let cols = bitmap[0].len();
 
         for x in 0..cols {
-            let ix = ((x as f32 / bmp_w) * max_x).round() as i32;
+            let x_norm = x as f32 / bmp_w;
 
             let mut is_pen_down = false;
             let mut run_start: Option<usize> = None;
 
             for y in 0..rows {
                 let pixel = bitmap[y][x];
-                let iy = ((y as f32 / bmp_h) * max_y).round() as i32;
+                let (ix, iy) = self.normalized_to_input(x_norm, y as f32 / bmp_h);
 
                 match (pixel, run_start) {
                     (true, None) => {
@@ -471,49 +464,130 @@ impl Pen {
     /// Draw using alpha values as pen pressure for anti-aliased rendering.
     /// Takes a Vec<Vec<u8>> of alpha values (0-255) and draws each pixel
     /// with pressure proportional to its alpha value.
+    ///
+    /// Pressure changes are applied inline during the stroke (like a real pen),
+    /// without lifting and re-pressing — this is both much faster and produces
+    /// smoother strokes than lift/press cycles per pressure level.
+    ///
+    /// Event emission is sparse: within a horizontal ink run only the run start,
+    /// pressure-change points, periodic keepalives and the run end are sent —
+    /// the display server interpolates straight segments in between. Combined
+    /// with periodic pauses this prevents flooding the evdev buffer, which makes
+    /// xochitl silently drop events (drawing "stops" partway with SYN_DROPPED).
     pub fn draw_bitmap_alpha_pressure(&mut self, alpha_bitmap: &[Vec<u8>], scale: u32) -> Result<()> {
-        let max_x = self.max_x_value() as f32;
-        let max_y = self.max_y_value() as f32;
         let bmp_w = VIRTUAL_WIDTH as f32 * scale as f32;
         let bmp_h = VIRTUAL_HEIGHT as f32 * scale as f32;
 
+        // Pause every N event writes to let xochitl drain its input queue
+        const WRITES_PER_PAUSE: usize = 64;
+        // Emit a keepalive point at least every N bitmap pixels within a run
+        const KEEPALIVE_PX: usize = 32;
+        let mut writes_since_pause = 0usize;
+
         for (y, row) in alpha_bitmap.iter().enumerate() {
-            let iy = ((y as f32 / bmp_h) * max_y).round() as i32;
+            let y_norm = y as f32 / bmp_h;
+            let cols = row.len();
+            let mut row_had_ink = false;
+            let mut x = 0usize;
 
-            let mut is_pen_down = false;
-            let mut last_pressure: i32 = 0;
-
-            for (x, &alpha) in row.iter().enumerate() {
-                if alpha <= 15 {
-                    if is_pen_down {
-                        self.pen_up()?;
-                        is_pen_down = false;
-                        sleep(Duration::from_millis(1));
-                    }
+            while x < cols {
+                if row[x] <= 15 {
+                    x += 1;
                     continue;
                 }
+                row_had_ink = true;
 
-                let ix = ((x as f32 / bmp_w) * max_x).round() as i32;
-                let pressure = (alpha as f32 / 255.0 * 2630.0).round() as i32;
-
-                if !is_pen_down || pressure != last_pressure {
-                    if is_pen_down {
-                        self.pen_up()?;
-                        sleep(Duration::from_millis(1));
-                    }
-                    self.goto_xy_with_pressure((ix, iy), pressure)?;
-                    is_pen_down = true;
-                    last_pressure = pressure;
-                } else {
-                    self.goto_xy((ix, iy))?;
+                // Find the end of this contiguous ink run
+                let run_start = x;
+                let mut run_end = x;
+                while run_end + 1 < cols && row[run_end + 1] > 15 {
+                    run_end += 1;
                 }
+
+                // Pen down at run start
+                let start = self.normalized_to_input(run_start as f32 / bmp_w, y_norm);
+                self.goto_xy_with_pressure(start, Self::alpha_to_pressure(row[run_start]))?;
+                writes_since_pause += 2;
+
+                // Walk the run: emit only when the quantized pressure changes,
+                // at periodic keepalive intervals, and at the run end
+                let mut last_bucket = row[run_start] >> 5;
+                let mut last_emit = run_start;
+                for xi in (run_start + 1)..=run_end {
+                    let bucket = row[xi] >> 5;
+                    if bucket != last_bucket || xi == run_end || xi - last_emit >= KEEPALIVE_PX {
+                        let pt = self.normalized_to_input(xi as f32 / bmp_w, y_norm);
+                        self.goto_xy_pressure(pt, Self::alpha_to_pressure(row[xi]))?;
+                        last_bucket = bucket;
+                        last_emit = xi;
+                        writes_since_pause += 1;
+                        if writes_since_pause >= WRITES_PER_PAUSE {
+                            sleep(Duration::from_millis(2));
+                            writes_since_pause = 0;
+                        }
+                    }
+                }
+
+                self.pen_up()?;
+                writes_since_pause += 1;
+                sleep(Duration::from_millis(1));
+
+                if writes_since_pause >= WRITES_PER_PAUSE {
+                    sleep(Duration::from_millis(2));
+                    writes_since_pause = 0;
+                }
+
+                x = run_end + 1;
             }
 
-            if is_pen_down {
-                self.pen_up()?;
-                is_pen_down = false;
+            // Only pause after rows that actually drew something
+            if row_had_ink {
+                sleep(Duration::from_millis(1));
             }
-            sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+
+    fn alpha_to_pressure(alpha: u8) -> i32 {
+        (alpha as f32 / 255.0 * 2630.0).round() as i32
+    }
+
+    /// Draw a small single-stroke "working" mark near the bottom-right corner.
+    /// It is exactly one stroke, so a single undo (two-finger tap) removes it.
+    pub fn draw_progress_mark(&mut self) -> Result<()> {
+        const BASE_X: i32 = 640;
+        const BASE_Y: i32 = 1012;
+
+        self.pen_up()?;
+        sleep(Duration::from_millis(2));
+        let start = self.virtual_to_input((BASE_X, BASE_Y));
+        self.pen_down_at(start)?;
+        sleep(Duration::from_millis(5));
+
+        // Small zigzag wave: ~50px wide
+        for i in 0..=24i32 {
+            let x = BASE_X + i * 2;
+            let y = BASE_Y + if (i / 4) % 2 == 0 { -4 } else { 4 };
+            self.goto_xy_virtual((x, y))?;
+            if i % 8 == 7 {
+                sleep(Duration::from_millis(1));
+            }
+        }
+
+        self.pen_up()?;
+        sleep(Duration::from_millis(5));
+        Ok(())
+    }
+
+    /// Move to position while pen is down, updating pressure inline (no lift).
+    fn goto_xy_pressure(&mut self, (x, y): (i32, i32), pressure: i32) -> Result<()> {
+        if let Some(device) = &mut self.device {
+            device.send_events(&[
+                InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, x),         // ABS_X
+                InputEvent::new(EvdevEventType::ABSOLUTE.0, 1, y),         // ABS_Y
+                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, pressure), // ABS_PRESSURE
+                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0),  // SYN_REPORT
+            ])?;
         }
         Ok(())
     }
@@ -637,16 +711,23 @@ impl Pen {
         // Swap and normalize the coordinates
         let x_normalized = x as f32 / VIRTUAL_WIDTH as f32;
         let y_normalized = y as f32 / VIRTUAL_HEIGHT as f32;
+        self.normalized_to_input(x_normalized, y_normalized)
+    }
 
+    /// Map normalized (0..1) virtual coordinates to device input coordinates,
+    /// applying the device-specific axis rotation.
+    /// On the RM2 the pen digitizer axes are rotated relative to the screen:
+    /// virtual y maps to device X (inverted), virtual x maps to device Y.
+    fn normalized_to_input(&self, x_norm: f32, y_norm: f32) -> (i32, i32) {
         match self.device_model {
             DeviceModel::RemarkablePaperPro => {
-                let x_input = (x_normalized * self.max_x_value() as f32) as i32;
-                let y_input = (y_normalized * self.max_y_value() as f32) as i32;
+                let x_input = (x_norm * self.max_x_value() as f32) as i32;
+                let y_input = (y_norm * self.max_y_value() as f32) as i32;
                 (x_input, y_input)
             }
             _ => {
-                let x_input = ((1.0 - y_normalized) * self.max_y_value() as f32) as i32;
-                let y_input = (x_normalized * self.max_x_value() as f32) as i32;
+                let x_input = ((1.0 - y_norm) * self.max_y_value() as f32) as i32;
+                let y_input = (x_norm * self.max_x_value() as f32) as i32;
                 (x_input, y_input)
             }
         }

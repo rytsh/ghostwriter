@@ -15,7 +15,55 @@ use crate::embedded_assets::get_uinput_module_data;
 
 pub type OptionMap = HashMap<String, String>;
 
+/// Sanitize SVG input coming from LLM tool calls.
+///
+/// LLM APIs sometimes deliver broken markup:
+/// - Literal `\u003c` / `\u003e` escape sequences leaking from JSON encoding
+///   (observed with the Anthropic API)
+/// - Fully HTML-entity-escaped markup (`&lt;svg ...&gt;`)
+/// - Markdown code fences or prose wrapped around the `<svg>` element
+pub fn sanitize_svg(raw: &str) -> String {
+    let mut svg = raw.to_string();
+
+    // 1. Literal \uXXXX escape sequences that leaked through JSON encoding
+    if svg.contains("\\u00") {
+        for (esc, ch) in [
+            ("\\u003c", "<"),
+            ("\\u003C", "<"),
+            ("\\u003e", ">"),
+            ("\\u003E", ">"),
+            ("\\u0026", "&"),
+            ("\\u0027", "'"),
+            ("\\u0022", "\""),
+        ] {
+            svg = svg.replace(esc, ch);
+        }
+    }
+
+    // 2. HTML-entity-escaped markup — only unescape when the whole document
+    //    looks escaped (a plain `&lt;` inside a <text> element is legitimate)
+    if !svg.contains("<svg") && svg.contains("&lt;svg") {
+        svg = svg
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&");
+    }
+
+    // 3. Extract the <svg>...</svg> element, dropping markdown fences or prose around it
+    if let (Some(start), Some(end)) = (svg.find("<svg"), svg.rfind("</svg>")) {
+        if start < end {
+            svg = svg[start..end + "</svg>".len()].to_string();
+        }
+    }
+
+    svg
+}
+
 pub fn svg_to_bitmap(svg_data: &str, width: u32, height: u32) -> Result<Vec<Vec<bool>>> {
+    let svg_data = &sanitize_svg(svg_data);
     let mut opt = Options::default();
     let mut fontdb = fontdb::Database::new();
     fontdb.load_system_fonts();
@@ -52,6 +100,7 @@ pub fn svg_to_bitmap(svg_data: &str, width: u32, height: u32) -> Result<Vec<Vec<
 
 /// Same as svg_to_bitmap but with configurable alpha threshold.
 pub fn svg_to_bitmap_threshold(svg_data: &str, width: u32, height: u32, threshold: u8) -> Result<Vec<Vec<bool>>> {
+    let svg_data = &sanitize_svg(svg_data);
     let mut opt = Options::default();
     let mut fontdb = fontdb::Database::new();
     fontdb.load_system_fonts();
@@ -86,6 +135,7 @@ pub fn svg_to_bitmap_threshold(svg_data: &str, width: u32, height: u32, threshol
 
 /// Same as svg_to_bitmap but returns alpha values (0-255) instead of boolean.
 pub fn svg_to_alpha_bitmap(svg_data: &str, width: u32, height: u32) -> Result<Vec<Vec<u8>>> {
+    let svg_data = &sanitize_svg(svg_data);
     let mut opt = Options::default();
     let mut fontdb = fontdb::Database::new();
     fontdb.load_system_fonts();
@@ -206,4 +256,46 @@ pub fn setup_uinput() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_svg;
+
+    #[test]
+    fn passes_clean_svg_through() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg"><rect x="1"/></svg>"#;
+        assert_eq!(sanitize_svg(svg), svg);
+    }
+
+    #[test]
+    fn fixes_unicode_escapes() {
+        let raw = r#"\u003csvg xmlns="http://www.w3.org/2000/svg"\u003e\u003crect/\u003e\u003c/svg\u003e"#;
+        assert_eq!(sanitize_svg(raw), r#"<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>"#);
+    }
+
+    #[test]
+    fn fixes_html_entity_escapes() {
+        let raw = "&lt;svg&gt;&lt;text&gt;a &amp; b&lt;/text&gt;&lt;/svg&gt;";
+        assert_eq!(sanitize_svg(raw), "<svg><text>a & b</text></svg>");
+    }
+
+    #[test]
+    fn fixes_double_escaped_unicode_entities() {
+        // \u0026lt; -> &lt; -> <
+        let raw = r#"\u0026lt;svg\u0026gt;\u0026lt;/svg\u0026gt;"#;
+        assert_eq!(sanitize_svg(raw), "<svg></svg>");
+    }
+
+    #[test]
+    fn strips_markdown_fences_and_prose() {
+        let raw = "Here is the drawing:\n```svg\n<svg><circle r=\"5\"/></svg>\n```\nDone!";
+        assert_eq!(sanitize_svg(raw), "<svg><circle r=\"5\"/></svg>");
+    }
+
+    #[test]
+    fn keeps_legitimate_entities_inside_text() {
+        let svg = "<svg><text>1 &lt; 2</text></svg>";
+        assert_eq!(sanitize_svg(svg), svg);
+    }
 }

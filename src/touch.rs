@@ -279,6 +279,58 @@ impl Touch {
         }
     }
 
+    /// Two-finger tap near the center of the screen — triggers undo in xochitl.
+    /// Used to remove the single-stroke progress mark drawn while processing.
+    pub async fn two_finger_tap_undo(&mut self) -> Result<()> {
+        match &mut self.mode {
+            TouchMode::Simulated { .. } => {
+                debug!("Simulated two_finger_tap_undo");
+                Ok(())
+            }
+            TouchMode::Real {
+                input_device, device_model, ..
+            } => {
+                let (x1, y1) = Self::virtual_to_input((350, 500), device_model);
+                let (x2, y2) = Self::virtual_to_input((420, 560), device_model);
+                if let Some(device) = input_device {
+                    // Press two fingers simultaneously
+                    device.send_events(&[
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_SLOT, 0),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_TRACKING_ID, 100),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_POSITION_X, x1),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_POSITION_Y, y1),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_PRESSURE, 100),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_TOUCH_MAJOR, 17),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_TOUCH_MINOR, 17),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_ORIENTATION, 4),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_SLOT, 1),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_TRACKING_ID, 101),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_POSITION_X, x2),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_POSITION_Y, y2),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_PRESSURE, 100),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_TOUCH_MAJOR, 17),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_TOUCH_MINOR, 17),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_ORIENTATION, 4),
+                        InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0),
+                    ])?;
+
+                    sleep(Duration::from_millis(100)).await;
+
+                    // Release both fingers
+                    device.send_events(&[
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_SLOT, 0),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_TRACKING_ID, -1),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_SLOT, 1),
+                        InputEvent::new(EvdevEventType::ABSOLUTE.0, ABS_MT_TRACKING_ID, -1),
+                        InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0),
+                    ])?;
+                    info!("two_finger_tap_undo sent");
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub async fn tap_middle_bottom(&mut self) -> Result<()> {
         self.touch_start((384, 1023)).await?; // middle bottom
         sleep(Duration::from_millis(100)).await;

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use base64::prelude::*;
 use log::{debug, info};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
 use tokio::time::{sleep, Duration};
@@ -10,10 +11,11 @@ use crate::config::Config;
 use crate::embedded_assets::load_config;
 use crate::keyboard::Keyboard;
 use crate::llm_engine::{LLMEngine, ModelExecutionStatus};
+use crate::pen::Pen;
 use crate::screenshot::Screenshot;
 use crate::segmenter::ImageAnalyzer;
 use crate::simulation::SimulationConfig;
-use crate::touch::Touch;
+use crate::touch::{Touch, TriggerCorner};
 
 /// Events that can trigger AI processing
 #[derive(Debug, Clone)]
@@ -275,6 +277,19 @@ pub async fn progress_task(
     Ok(())
 }
 
+/// Remove the progress mark with a two-finger tap (undo) if it is still on screen.
+/// Uses a fresh Touch instance to avoid deadlocking with trigger_task, which holds
+/// the shared touch lock while waiting for the next trigger.
+pub async fn clear_progress_mark(indicator: &AtomicBool) {
+    if indicator.swap(false, Ordering::SeqCst) {
+        let mut touch = Touch::new(false, TriggerCorner::UpperRight);
+        if let Err(e) = touch.two_finger_tap_undo().await {
+            info!("Failed to undo progress mark: {}", e);
+        }
+        sleep(Duration::from_millis(400)).await; // let xochitl process the undo
+    }
+}
+
 /// Task that processes a trigger: screenshot → LLM → tool execution
 pub async fn processing_task(
     config: Config,
@@ -282,6 +297,8 @@ pub async fn processing_task(
     progress_tx: watch::Sender<ProgressState>,
     cancellation: Arc<GhostwriterCancellation>,
     touch: Arc<tokio::sync::RwLock<Touch>>,
+    pen: Arc<Mutex<Pen>>,
+    indicator: Arc<AtomicBool>,
 ) -> Result<()> {
     info!("Processing task: starting");
 
@@ -313,6 +330,20 @@ pub async fn processing_task(
         info!("Skipping LLM submission (no_submit mode)");
         let _ = progress_tx.send(ProgressState::Done);
         return Ok(());
+    }
+
+    // Draw a small single-stroke "working" mark so the user can see the trigger
+    // registered. Drawn AFTER the screenshot so it never appears in model input.
+    // Removed later with a single undo (two-finger tap).
+    if !config.no_draw && !config.is_test_mode() {
+        let draw_result = {
+            let mut pen_guard = pen.lock().map_err(|e| anyhow::anyhow!("Pen lock poisoned: {}", e))?;
+            pen_guard.draw_progress_mark()
+        };
+        match draw_result {
+            Ok(()) => indicator.store(true, Ordering::SeqCst),
+            Err(e) => info!("Failed to draw progress mark: {}", e),
+        }
     }
 
     // Tap middle bottom to position cursor for text input (before showing "Thinking")
@@ -384,6 +415,12 @@ pub async fn processing_task(
         info!("Would write model output to {}", model_output_file);
         // Note: The actual model output would need to be captured from the engine
         // This is a placeholder - the LLMEngine trait would need to expose the raw response
+    }
+
+    // If the model didn't call draw_svg (which removes the mark before drawing),
+    // remove the progress mark now — also covers errors and cancellations
+    if !config.no_draw && !config.is_test_mode() {
+        clear_progress_mark(&indicator).await;
     }
 
     // Handle execution result
